@@ -50,7 +50,7 @@ calls the rating field `overall`. Kaggle calls it `star_rating`. UCSD uses `True
 for verified purchases. Kaggle uses `Y/N`. These conflicts are exactly what the Silver
 layer is built to resolve. Building a pipeline that handles one perfectly clean source
 is not a useful skill. Building one that reconciles two messy, structurally different
-sources into a single unified schema — that is what real data work looks like.
+sources into a single unified schema, that is what real data work looks like.
 
 ---
 
