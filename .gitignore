@@ -1,0 +1,32 @@
+# Environment
+.env
+*.env
+
+# Raw data files — these are large, never commit them
+data/raw/
+data/
+
+# Logs
+logs/*.log
+logs/*.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

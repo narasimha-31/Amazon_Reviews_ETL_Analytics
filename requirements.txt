@@ -1,0 +1,17 @@
+# Core
+pandas==2.2.2
+numpy==1.26.4
+python-dotenv==1.0.1
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.30
+tqdm==4.66.4
+requests==2.32.3
+
+# Phase 3 - NLP (install when you reach Phase 3)
+# vaderSentiment==3.3.2
+# spacy==3.7.4
+# scikit-learn==1.4.2
+
+# Phase 5 - Orchestration (install when you reach Phase 5)
+# apache-airflow==2.9.1
+# great-expectations==0.18.15
