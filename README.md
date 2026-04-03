@@ -1,18 +1,18 @@
 # Amazon Reviews Intelligence Platform
 
 > A full end-to-end data pipeline and analytics project built on 44 million real,
-> raw Amazon customer reviews — from ingestion to business intelligence dashboards.
+> raw Amazon customer reviews, from ingestion to business intelligence dashboards.
 
 ---
 
 ## Why I built this
 
 I wanted a portfolio project that actually reflects what data analysts and engineers
-do inside a company — not a cleaned Kaggle CSV with a Jupyter notebook on top of it.
+do inside a company, not a cleaned Kaggle CSV with a Jupyter notebook on top of it.
 
 The problem I chose to solve is real: Amazon sellers, category managers, and marketplace
 teams are sitting on millions of customer reviews but most of them have no systematic
-way to answer basic questions like — which product attributes actually correlate with
+way to answer basic questions like, which product attributes actually correlate with
 higher sales rank? Where are the fake reviews concentrated? What does a customer mean
 when they give something 3 stars vs 5 stars? What is the sentiment gap between what
 the star rating says and what the review text actually says?
@@ -33,13 +33,13 @@ or product analyst could actually use week to week.
 This is a deliberate engineering decision, not just collecting more data for the
 sake of it.
 
-**UCSD Amazon Reviews 2023 (5-core)** — 41 million reviews across all product
+**UCSD Amazon Reviews 2023 (5-core)**, 41 million reviews across all product
 categories. The JSON format includes rich metadata: reviewer ID, product ASIN,
 rating, review text, helpful votes. This is the primary NLP and sentiment dataset
 because of its breadth across categories.
 
-**Kaggle / AWS Customer Reviews (Electronics)** — 3 million Electronics-specific
-reviews in TSV format. This dataset has fields the UCSD one does not — `vine`
+**Kaggle / AWS Customer Reviews (Electronics)**, 3 million Electronics-specific
+reviews in TSV format. This dataset has fields the UCSD one does not, `vine`
 (whether the reviewer is in Amazon's Vine program), `helpful_votes` separated
 from `total_votes`, and `marketplace` (country). It also uses completely different
 column names for the same concepts.
@@ -335,12 +335,12 @@ SELECT 'pipeline_log entries', COUNT(*) FROM bronze.pipeline_log;
 
 **Why PostgreSQL and not a cloud warehouse?**
 Fully reproducible locally at zero cost. PostgreSQL SQL is nearly identical to
-BigQuery and Redshift — migrating to cloud is a config change, not a rewrite.
+BigQuery and Redshift, migrating to cloud is a config change, not a rewrite.
 
 **Why two datasets with overlapping content?**
 Because real companies never have one clean source. The schema conflicts between
-UCSD and Kaggle — different field names, different boolean encoding, different
-timestamp formats — are exactly what a Silver layer is designed to solve.
+UCSD and Kaggle, different field names, different boolean encoding, different
+timestamp formats, are exactly what a Silver layer is designed to solve.
 That normalization work is the actual skill being demonstrated.
 
 **Why store Bronze as raw TEXT with no type casting?**
@@ -350,5 +350,5 @@ already there. Bronze is the audit trail. Silver is where decisions happen.
 
 **Why a dead-letter queue instead of dropping bad rows?**
 Silently dropping rows hides problems. The `silver.rejected_reviews` table
-captures every rejected row with a tagged reason — null rating, invalid type,
+captures every rejected row with a tagged reason, null rating, invalid type,
 duplicate key. That table is what you check when downstream metrics suddenly shift.
