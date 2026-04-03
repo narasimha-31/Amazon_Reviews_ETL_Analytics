@@ -106,12 +106,25 @@ def load_ucsd_file(conn, gz_path: Path, category: str, run_id: str):
         ON CONFLICT DO NOTHING
     """
 
+    def clean(val):
+        """Strip NUL bytes (0x00) that PostgreSQL refuses to store.
+        These appear in ~0.01% of raw Amazon review texts.
+        We clean at insert time so Bronze still reflects real source data
+        minus only the characters that make storage impossible."""
+        if val is None:
+            return None
+        if isinstance(val, str):
+            return val.replace("\x00", "").replace("\u0000", "")
+        return val
+
     def flush_chunk(rows):
         nonlocal loaded_rows
+        # Strip NUL bytes from every string field in every row before inserting
+        cleaned = [tuple(clean(v) for v in row) for row in rows]
         with conn.cursor() as cur:
-            execute_values(cur, INSERT_SQL, rows, page_size=1000)
+            execute_values(cur, INSERT_SQL, cleaned, page_size=1000)
         conn.commit()
-        loaded_rows += len(rows)
+        loaded_rows += len(cleaned)
 
     try:
         with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as f:
