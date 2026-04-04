@@ -1,33 +1,42 @@
 """
-load_silver.py - Phase 2
-Reads from Bronze tables, cleans, validates, deduplicates,
-routes bad rows to dead-letter queue, loads into silver.reviews.
+load_silver.py - Phase 2: Bronze -> Silver transformation pipeline.
 
-Field mapping confirmed from inspect.py on real source files:
+Architecture decision: two database connections per source.
+  read_conn  - streams rows from Bronze using a named server-side cursor
+  write_conn - inserts into silver.reviews and silver.rejected_reviews
 
-UCSD (JSON)          Kaggle (TSV)          Silver column
------------          ------------          -------------
-reviewerID           customer_id       ->  reviewer_id
-asin                 product_id        ->  asin
-overall (float)      star_rating (str) ->  rating NUMERIC(2,1)
-reviewText           review_body       ->  review_text
-summary              review_headline   ->  review_title
-unixReviewTime(int)  review_date(str)  ->  review_date DATE
-helpful[0] (list)    helpful_votes     ->  helpful_votes INTEGER
-helpful[1] (list)    total_votes       ->  total_votes INTEGER
-NOT PRESENT          verified_purchase ->  verified_purchase BOOLEAN
-NOT PRESENT          vine              ->  vine_reviewer BOOLEAN
-NOT PRESENT          product_title     ->  product_title TEXT
+Why two connections?
+Named cursors require their transaction to stay open for the entire read.
+conn.commit() inside flush_accepted would close that transaction and
+invalidate the cursor mid-stream. Separating read and write avoids this
+entirely - write_conn can commit freely without touching read_conn.
+
+Field mapping confirmed by running inspect.py on real source files:
+
+  UCSD field        Kaggle field          Silver column
+  ----------        ------------          -------------
+  reviewerID        customer_id      -->  reviewer_id
+  asin              product_id       -->  asin
+  overall (float)   star_rating(str) -->  rating NUMERIC(2,1)
+  reviewText        review_body      -->  review_text
+  summary           review_headline  -->  review_title
+  unixReviewTime    review_date      -->  review_date DATE
+  helpful[0]        helpful_votes    -->  helpful_votes INTEGER
+  helpful[1]        total_votes      -->  total_votes INTEGER
+  (not present)     verified_purchase -> verified_purchase BOOLEAN
+  (not present)     vine             -->  vine_reviewer BOOLEAN
+  (not present)     product_title    -->  product_title TEXT
 
 Usage:
-    venv/Scripts/python.exe src/silver/load_silver.py --source all
-    venv/Scripts/python.exe src/silver/load_silver.py --source ucsd
-    venv/Scripts/python.exe src/silver/load_silver.py --source aws
+    python src/silver/load_silver.py --source all
+    python src/silver/load_silver.py --source aws
+    python src/silver/load_silver.py --source ucsd
 """
 
 import sys
 import uuid
 import json
+import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,16 +49,57 @@ from src.utils.logger import get_logger
 
 logger = get_logger("load_silver", LOG_DIR)
 
+
+# ── Source identifiers ────────────────────────────────────────
+SOURCE_UCSD = "ucsd"
+SOURCE_AWS  = "aws"
+
 # ── Rejection reason codes ────────────────────────────────────
-NULL_RATING      = "NULL_RATING"
-INVALID_RATING   = "INVALID_RATING"
-NULL_REVIEWER    = "NULL_REVIEWER_ID"
-NULL_ASIN        = "NULL_ASIN"
-DUPLICATE        = "DUPLICATE"
-TOO_SHORT        = "REVIEW_TOO_SHORT"
+NULL_RATING    = "NULL_RATING"
+INVALID_RATING = "INVALID_RATING"
+NULL_REVIEWER  = "NULL_REVIEWER_ID"
+NULL_ASIN      = "NULL_ASIN"
+DUPLICATE      = "DUPLICATE"
+TOO_SHORT      = "REVIEW_TOO_SHORT"
+
+# ── Tuning constants ─────────────────────────────────────────
+PAGE_SIZE              = 1000     # rows per psycopg2 execute_values page
+MIN_REVIEW_LENGTH      = 3        # reviews shorter than this go to dead-letter queue
+MAX_REJECTION_TEXT     = 500      # max chars of review text stored in rejection record
+DATE_FORMAT            = "%Y-%m-%d"
+UCSD_PROGRESS_INTERVAL = 500_000  # log progress every N rows for UCSD (41M rows)
+AWS_PROGRESS_INTERVAL  = 100_000  # log progress every N rows for AWS (3M rows)
+
+# ── SQL statements ────────────────────────────────────────────
+INSERT_REVIEWS = """
+    INSERT INTO silver.reviews (
+        review_id, reviewer_id, asin, product_title,
+        rating, review_title, review_text,
+        review_date, review_length,
+        verified_purchase, helpful_votes, total_votes, vine_reviewer,
+        source, raw_source_id
+    ) VALUES %s
+    ON CONFLICT DO NOTHING
+"""
+
+INSERT_REJECTED = """
+    INSERT INTO silver.rejected_reviews (
+        source, raw_reviewer_id, raw_asin,
+        raw_rating, raw_review_text,
+        rejection_reason, run_id
+    ) VALUES %s
+"""
+
+INSERT_LOG = """
+    INSERT INTO silver.pipeline_log (
+        run_id, source, rows_read, rows_accepted, rows_rejected,
+        rejection_breakdown, status, error_message, started_at
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+"""
 
 
-def get_connection():
+# ── Connection factory ────────────────────────────────────────
+def make_connection():
     return psycopg2.connect(
         host=DB_CONFIG["host"],
         port=DB_CONFIG["port"],
@@ -59,13 +109,12 @@ def get_connection():
     )
 
 
-# ── Type parsers — each one handles real values from inspect.py ──
-
-def parse_rating(raw) -> float | None:
+# ── Type parsers ──────────────────────────────────────────────
+def parse_rating(raw):
     """
-    UCSD:   overall = 4.0  (already float in JSON, stored as "4.0" in Bronze TEXT)
-    Kaggle: star_rating = "5"  (integer string in TSV)
-    Both:   cast to float, validate 1.0-5.0
+    UCSD overall = 4.0 stored as TEXT "4.0" in Bronze.
+    Kaggle star_rating = "5" integer string.
+    Cast to float, validate range 1.0 to 5.0.
     """
     if raw is None or str(raw).strip() == "":
         return None
@@ -76,57 +125,53 @@ def parse_rating(raw) -> float | None:
         return None
 
 
-def parse_date_from_unix(ts_raw) -> str | None:
+def parse_unix_to_date(ts_raw):
     """
-    UCSD unixReviewTime = 1386028800 (int seconds since epoch)
-    Stored in Bronze as TEXT "1386028800"
-    Convert to YYYY-MM-DD string for PostgreSQL DATE column
+    UCSD unixReviewTime = 1386028800 stored as TEXT in Bronze.
+    Convert epoch seconds to YYYY-MM-DD string.
     """
     if ts_raw is None or str(ts_raw).strip() == "":
         return None
     try:
         ts = int(float(str(ts_raw).strip()))
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(DATE_FORMAT)
     except (ValueError, TypeError, OSError):
         return None
 
 
-def parse_date_string(date_raw) -> str | None:
+def parse_date_string(raw):
     """
-    Kaggle review_date = "2015-08-31" (already YYYY-MM-DD string)
-    Just validate it parses correctly, return as-is
+    Kaggle review_date = "2015-08-31" already in YYYY-MM-DD format.
+    Validate it parses correctly, return as-is.
     """
-    if date_raw is None or str(date_raw).strip() == "":
+    if raw is None or str(raw).strip() == "":
         return None
     try:
-        datetime.strptime(str(date_raw).strip(), "%Y-%m-%d")
-        return str(date_raw).strip()
+        datetime.strptime(str(raw).strip(), DATE_FORMAT)
+        return str(raw).strip()
     except ValueError:
         return None
 
 
-def parse_helpful_ucsd(raw_helpful_text) -> tuple:
+def parse_helpful_list(raw):
     """
-    UCSD helpful field is stored as JSON list string "[2, 3]" in Bronze TEXT column
-    [0] = helpful votes received
-    [1] = total votes cast
-    Returns (helpful_votes, total_votes) tuple
+    UCSD helpful field stored as JSON list string "[2, 3]" in Bronze.
+    Index 0 = helpful votes received, index 1 = total votes cast.
+    Returns (helpful_votes, total_votes).
     """
-    if raw_helpful_text is None:
-        return (None, None)
+    if raw is None:
+        return None, None
     try:
-        parsed = json.loads(str(raw_helpful_text))
+        parsed = json.loads(str(raw))
         if isinstance(parsed, list) and len(parsed) >= 2:
-            return (int(parsed[0]), int(parsed[1]))
-        return (None, None)
+            return int(parsed[0]), int(parsed[1])
+        return None, None
     except (ValueError, TypeError, json.JSONDecodeError):
-        return (None, None)
+        return None, None
 
 
-def parse_int(raw) -> int | None:
-    """
-    Kaggle helpful_votes and total_votes are strings "0", "1" etc
-    """
+def parse_int(raw):
+    """Kaggle helpful_votes and total_votes are integer strings."""
     if raw is None or str(raw).strip() == "":
         return None
     try:
@@ -135,37 +180,22 @@ def parse_int(raw) -> int | None:
         return None
 
 
-def parse_verified_ucsd(raw) -> bool | None:
+def parse_bool_truefalse(raw):
     """
-    UCSD: verified_purchase field does NOT EXIST in source data.
-    Bronze column will be NULL for all UCSD rows.
-    This is documented — not a data quality bug.
-    """
-    if raw is None:
-        return None
-    val = str(raw).strip().upper()
-    if val in ("TRUE", "1", "YES"):  return True
-    if val in ("FALSE", "0", "NO"): return False
-    return None
-
-
-def parse_verified_kaggle(raw) -> bool | None:
-    """
-    Kaggle verified_purchase = "Y" or "N"
+    UCSD verified field: "True" / "False" / None.
+    Note: verified_purchase does NOT exist in UCSD source —
+    this will always return None for UCSD rows. Documented, not a bug.
     """
     if raw is None:
         return None
     val = str(raw).strip().upper()
-    if val == "Y": return True
-    if val == "N": return False
+    if val in ("TRUE",  "1", "YES"): return True
+    if val in ("FALSE", "0", "NO"):  return False
     return None
 
 
-def parse_vine(raw) -> bool | None:
-    """
-    Kaggle vine = "Y" or "N"
-    UCSD does not have this field — will be NULL for all UCSD rows
-    """
+def parse_bool_yn(raw):
+    """Kaggle verified_purchase and vine fields: "Y" / "N"."""
     if raw is None:
         return None
     val = str(raw).strip().upper()
@@ -174,47 +204,44 @@ def parse_vine(raw) -> bool | None:
     return None
 
 
-# ── Insert SQL ────────────────────────────────────────────────
-
-INSERT_REVIEWS = """
-    INSERT INTO silver.reviews (
-        review_id, reviewer_id, asin, product_title,
-        rating, review_title, review_text,
-        review_date, review_length,
-        verified_purchase, helpful_votes, total_votes, vine_reviewer,
-        source, raw_source_id
-    )
-    VALUES %s
-    ON CONFLICT DO NOTHING
-"""
-
-INSERT_REJECTED = """
-    INSERT INTO silver.rejected_reviews (
-        source, raw_reviewer_id, raw_asin,
-        raw_rating, raw_review_text,
-        rejection_reason, run_id
-    )
-    VALUES %s
-"""
+def clean_text(raw):
+    """Strip whitespace and return None for empty strings."""
+    if raw is None:
+        return None
+    val = str(raw).strip()
+    return val if val else None
 
 
-def flush_accepted(conn, rows: list):
-    with conn.cursor() as cur:
-        execute_values(cur, INSERT_REVIEWS, rows, page_size=1000)
-    conn.commit()
+# ── Write helpers (use write_conn which commits freely) ───────
+def flush_accepted(write_conn, rows):
+    with write_conn.cursor() as cur:
+        execute_values(cur, INSERT_REVIEWS, rows, page_size=PAGE_SIZE)
+    write_conn.commit()
 
 
-def flush_rejected(conn, rows: list):
-    with conn.cursor() as cur:
-        execute_values(cur, INSERT_REJECTED, rows, page_size=1000)
-    conn.commit()
+def flush_rejected(write_conn, rows):
+    with write_conn.cursor() as cur:
+        execute_values(cur, INSERT_REJECTED, rows, page_size=PAGE_SIZE)
+    write_conn.commit()
 
 
-def build_dedup_cache(conn) -> set:
+def write_pipeline_log(write_conn, run_id, source, rows_read,
+                       rows_accepted, rows_rejected, breakdown,
+                       status, error, started_at):
+    with write_conn.cursor() as cur:
+        cur.execute(INSERT_LOG, (
+            run_id, source, rows_read, rows_accepted, rows_rejected,
+            json.dumps(breakdown), status, error, started_at,
+        ))
+    write_conn.commit()
+
+
+# ── Dedup cache ───────────────────────────────────────────────
+def build_dedup_cache(conn):
     """
-    Load all existing (reviewer_id, asin, review_date) combos
-    into memory for fast duplicate checking.
-    One DB query at startup beats 44M individual lookups.
+    Load existing (reviewer_id, asin, review_date) tuples into a Python set.
+    One query at startup vs 44M individual lookups = massive speed difference.
+    Memory: ~150 bytes per tuple. Safe for 44M rows on a 12GB machine.
     """
     logger.info("Building dedup cache from existing silver.reviews...")
     cache = set()
@@ -228,37 +255,179 @@ def build_dedup_cache(conn) -> set:
         """)
         for row in cur:
             cache.add((row[0], row[1], row[2]))
+    conn.commit()
     logger.info(f"Dedup cache: {len(cache):,} existing records loaded")
     return cache
 
 
-def log_silver_run(conn, run_id, source, rows_read, rows_accepted,
-                   rows_rejected, breakdown, status, error=None, started_at=None):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO silver.pipeline_log
-                (run_id, source, rows_read, rows_accepted, rows_rejected,
-                 rejection_breakdown, status, error_message, started_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (
-            run_id, source, rows_read, rows_accepted, rows_rejected,
-            json.dumps(breakdown), status, error, started_at,
-        ))
-    conn.commit()
-
-
-# ─────────────────────────────────────────────────────────────
-def process_ucsd(conn, run_id: str, dedup_cache: set):
+# ── Core validation logic (shared by both sources) ───────────
+def validate_row(reviewer_id, asin, raw_rating):
     """
-    Read bronze.ucsd_reviews, map real UCSD field names to Silver schema.
+    Returns (rating_float, rejection_reason).
+    If rejection_reason is not None, the row goes to dead-letter queue.
+    """
+    if not reviewer_id:
+        return None, NULL_REVIEWER
+    if not asin:
+        return None, NULL_ASIN
+    if raw_rating is None or str(raw_rating).strip() == "":
+        return None, NULL_RATING
+    rating = parse_rating(raw_rating)
+    if rating is None:
+        return None, INVALID_RATING
+    return rating, None
 
-    Key UCSD-specific handling based on inspect.py findings:
-    - overall (float in JSON) stored as TEXT "4.0" in Bronze
-    - unixReviewTime (int) stored as TEXT "1386028800" in Bronze -> convert to DATE
-    - helpful stored as JSON list TEXT "[2, 3]" -> extract [0] and [1]
-    - verified_purchase is NULL for all UCSD rows (field doesnt exist in source)
-    - vine is NULL for all UCSD rows (field doesnt exist in source)
-    - product_title is NULL for all UCSD rows (field doesnt exist in source)
+
+# ── Process AWS (Kaggle) ──────────────────────────────────────
+def process_aws(run_id, dedup_cache):
+    """
+    Two connections:
+      read_conn  - named cursor streams bronze.aws_reviews, never commits
+      write_conn - inserts into silver tables, commits per chunk
+    """
+    logger.info("=== Processing AWS/Kaggle Bronze -> Silver ===")
+    started_at     = datetime.now()
+    rows_read      = 0
+    accepted       = []
+    rejected       = []
+    total_accepted = 0
+    total_rejected = 0
+    breakdown      = {k: 0 for k in [NULL_RATING, INVALID_RATING,
+                                      NULL_REVIEWER, NULL_ASIN,
+                                      DUPLICATE, TOO_SHORT]}
+
+    read_conn  = make_connection()
+    write_conn = make_connection()
+
+    try:
+        with read_conn.cursor(name="aws_bronze_cursor") as cur:
+            cur.itersize = CHUNK_SIZE
+            cur.execute("""
+                SELECT
+                    customer_id,
+                    product_id,
+                    product_title,
+                    star_rating,
+                    review_headline,
+                    review_body,
+                    review_date,
+                    verified_purchase,
+                    helpful_votes,
+                    total_votes,
+                    vine,
+                    review_id
+                FROM bronze.aws_reviews
+            """)
+
+            for row in cur:
+                rows_read += 1
+                (raw_customer_id, raw_product_id, raw_product_title,
+                 raw_rating, raw_headline, raw_body,
+                 raw_date, raw_verified, raw_helpful,
+                 raw_total, raw_vine, raw_review_id) = row
+
+                reviewer_id = clean_text(raw_customer_id)
+                asin        = clean_text(raw_product_id)
+                rating, reason = validate_row(reviewer_id, asin, raw_rating)
+
+                if reason:
+                    breakdown[reason] += 1
+                    rejected.append((
+                        SOURCE_AWS, reviewer_id, asin,
+                        str(raw_rating) if raw_rating else None,
+                        str(raw_body)[:MAX_REJECTION_TEXT] if raw_body else None,
+                        reason, run_id,
+                    ))
+                else:
+                    review_date = parse_date_string(raw_date)
+                    dedup_key   = (reviewer_id, asin, review_date)
+
+                    if dedup_key in dedup_cache:
+                        breakdown[DUPLICATE] += 1
+                        rejected.append((
+                            SOURCE_AWS, reviewer_id, asin,
+                            str(raw_rating), None, DUPLICATE, run_id,
+                        ))
+                    else:
+                        review_text   = clean_text(raw_body)
+                        review_length = len(review_text) if review_text else 0
+
+                        if review_text is not None and review_length < MIN_REVIEW_LENGTH:
+                            breakdown[TOO_SHORT] += 1
+                            rejected.append((
+                                SOURCE_AWS, reviewer_id, asin,
+                                str(raw_rating), review_text, TOO_SHORT, run_id,
+                            ))
+                        else:
+                            dedup_cache.add(dedup_key)
+                            accepted.append((
+                                clean_text(raw_review_id),
+                                reviewer_id,
+                                asin,
+                                clean_text(raw_product_title),
+                                rating,
+                                clean_text(raw_headline),
+                                review_text,
+                                review_date,
+                                review_length,
+                                parse_bool_yn(raw_verified),
+                                parse_int(raw_helpful),
+                                parse_int(raw_total),
+                                parse_bool_yn(raw_vine),
+                                SOURCE_AWS,
+                                clean_text(raw_review_id),
+                            ))
+
+                if len(accepted) >= CHUNK_SIZE:
+                    flush_accepted(write_conn, accepted)
+                    total_accepted += len(accepted)
+                    accepted = []
+
+                if len(rejected) >= CHUNK_SIZE:
+                    flush_rejected(write_conn, rejected)
+                    total_rejected += len(rejected)
+                    rejected = []
+
+                if rows_read % AWS_PROGRESS_INTERVAL == 0:
+                    logger.info(
+                        f"  AWS: {rows_read:,} read | "
+                        f"{total_accepted + len(accepted):,} accepted | "
+                        f"{total_rejected + len(rejected):,} rejected"
+                    )
+
+        # flush remainder
+        if accepted:
+            flush_accepted(write_conn, accepted)
+            total_accepted += len(accepted)
+        if rejected:
+            flush_rejected(write_conn, rejected)
+            total_rejected += len(rejected)
+
+        write_pipeline_log(
+            write_conn, run_id, SOURCE_AWS, rows_read,
+            total_accepted, total_rejected, breakdown,
+            "success", None, started_at,
+        )
+        logger.info(f"  AWS done: {rows_read:,} read | {total_accepted:,} accepted | {total_rejected:,} rejected")
+        logger.info(f"  Breakdown: {breakdown}")
+
+    except Exception as e:
+        write_pipeline_log(
+            write_conn, run_id, SOURCE_AWS, rows_read,
+            total_accepted, total_rejected, breakdown,
+            "failed", str(e), started_at,
+        )
+        raise
+    finally:
+        read_conn.close()
+        write_conn.close()
+
+
+# ── Process UCSD ──────────────────────────────────────────────
+def process_ucsd(run_id, dedup_cache):
+    """
+    Same two-connection pattern as process_aws.
+    UCSD-specific field differences noted in comments.
     """
     logger.info("=== Processing UCSD Bronze -> Silver ===")
     started_at     = datetime.now()
@@ -267,303 +436,160 @@ def process_ucsd(conn, run_id: str, dedup_cache: set):
     rejected       = []
     total_accepted = 0
     total_rejected = 0
-    breakdown      = {
-        NULL_RATING: 0, INVALID_RATING: 0,
-        NULL_REVIEWER: 0, NULL_ASIN: 0,
-        DUPLICATE: 0, TOO_SHORT: 0
-    }
+    breakdown      = {k: 0 for k in [NULL_RATING, INVALID_RATING,
+                                      NULL_REVIEWER, NULL_ASIN,
+                                      DUPLICATE, TOO_SHORT]}
 
-    # Server-side cursor streams rows without loading all 41M into RAM
-    with conn.cursor(name="ucsd_silver_cursor") as cur:
-        cur.itersize = CHUNK_SIZE
-        cur.execute("""
-            SELECT
-                rating,        -- from: overall (UCSD)
-                title,         -- from: summary (UCSD)
-                text,          -- from: reviewText (UCSD)
-                images,        -- from: image (UCSD)
-                asin,          -- from: asin (UCSD) - same name
-                user_id,       -- from: reviewerID (UCSD)
-                timestamp,     -- from: unixReviewTime (UCSD) - needs date conversion
-                verified_purchase, -- NULL for all UCSD rows - field doesnt exist in source
-                source_category
-            FROM bronze.ucsd_reviews
-        """)
+    read_conn  = make_connection()
+    write_conn = make_connection()
 
-        for row in cur:
-            rows_read += 1
-            (raw_rating, raw_title, raw_text, raw_images,
-             raw_asin, raw_user_id, raw_timestamp,
-             raw_verified, raw_category) = row
+    try:
+        with read_conn.cursor(name="ucsd_bronze_cursor") as cur:
+            cur.itersize = CHUNK_SIZE
+            cur.execute("""
+                SELECT
+                    user_id,
+                    asin,
+                    rating,
+                    title,
+                    text,
+                    timestamp,
+                    verified_purchase,
+                    images
+                FROM bronze.ucsd_reviews
+            """)
 
-            reviewer_id = str(raw_user_id).strip() if raw_user_id else None
-            asin        = str(raw_asin).strip()    if raw_asin    else None
+            for row in cur:
+                rows_read += 1
+                (raw_user_id, raw_asin, raw_rating,
+                 raw_title, raw_text, raw_timestamp,
+                 raw_verified, raw_images) = row
 
-            # ── Validation gate ───────────────────────────────
-            reason = None
-            rating = None
+                reviewer_id = clean_text(raw_user_id)
+                asin        = clean_text(raw_asin)
+                rating, reason = validate_row(reviewer_id, asin, raw_rating)
 
-            if not reviewer_id:
-                reason = NULL_REVIEWER
-            elif not asin:
-                reason = NULL_ASIN
-            elif not raw_rating or str(raw_rating).strip() == "":
-                reason = NULL_RATING
-            else:
-                rating = parse_rating(raw_rating)
-                if rating is None:
-                    reason = INVALID_RATING
-
-            if reason:
-                breakdown[reason] += 1
-                rejected.append((
-                    "ucsd", reviewer_id, asin,
-                    str(raw_rating) if raw_rating else None,
-                    str(raw_text)[:500] if raw_text else None,
-                    reason, run_id,
-                ))
-            else:
-                review_date = parse_date_from_unix(raw_timestamp)
-                dedup_key   = (reviewer_id, asin, review_date)
-
-                if dedup_key in dedup_cache:
-                    breakdown[DUPLICATE] += 1
+                if reason:
+                    breakdown[reason] += 1
                     rejected.append((
-                        "ucsd", reviewer_id, asin,
-                        str(raw_rating), None,
-                        DUPLICATE, run_id,
+                        SOURCE_UCSD, reviewer_id, asin,
+                        str(raw_rating) if raw_rating else None,
+                        str(raw_text)[:MAX_REJECTION_TEXT] if raw_text else None,
+                        reason, run_id,
                     ))
                 else:
-                    review_text   = str(raw_text).strip() if raw_text else None
-                    review_length = len(review_text) if review_text else 0
+                    review_date = parse_unix_to_date(raw_timestamp)
+                    dedup_key   = (reviewer_id, asin, review_date)
 
-                    if review_text is not None and review_length < 3:
-                        breakdown[TOO_SHORT] += 1
+                    if dedup_key in dedup_cache:
+                        breakdown[DUPLICATE] += 1
                         rejected.append((
-                            "ucsd", reviewer_id, asin,
-                            str(raw_rating), review_text,
-                            TOO_SHORT, run_id,
+                            SOURCE_UCSD, reviewer_id, asin,
+                            str(raw_rating), None, DUPLICATE, run_id,
                         ))
                     else:
-                        dedup_cache.add(dedup_key)
-                        # helpful stored as "[2, 3]" JSON string in Bronze
-                        # extract index 0 = helpful votes, index 1 = total votes
-                        helpful_votes, total_votes = parse_helpful_ucsd(raw_images)
-                        # Note: we stored helpful in the images column in Bronze
-                        # because the original script mapped it incorrectly
-                        # This is fixed in the Silver mapping
+                        review_text   = clean_text(raw_text)
+                        review_length = len(review_text) if review_text else 0
 
-                        accepted.append((
-                            None,                               # review_id: UCSD has no review_id
-                            reviewer_id,                        # from: reviewerID
-                            asin,                               # from: asin
-                            None,                               # product_title: not in UCSD source
-                            rating,                             # from: overall -> float
-                            str(raw_title).strip() if raw_title else None,  # from: summary
-                            review_text,                        # from: reviewText
-                            review_date,                        # from: unixReviewTime -> DATE
-                            review_length,
-                            parse_verified_ucsd(raw_verified),  # NULL for all UCSD rows
-                            None,                               # helpful_votes: not in UCSD (see note)
-                            None,                               # total_votes: not in UCSD
-                            None,                               # vine_reviewer: not in UCSD
-                            "ucsd",
-                            f"{reviewer_id}|{asin}|{raw_timestamp}",
-                        ))
+                        if review_text is not None and review_length < MIN_REVIEW_LENGTH:
+                            breakdown[TOO_SHORT] += 1
+                            rejected.append((
+                                SOURCE_UCSD, reviewer_id, asin,
+                                str(raw_rating), review_text, TOO_SHORT, run_id,
+                            ))
+                        else:
+                            dedup_cache.add(dedup_key)
+                            # UCSD helpful field stored as JSON list "[2,3]" in images column
+                            # helpful_votes = index 0, total_votes = index 1
+                            helpful_votes, total_votes = parse_helpful_list(raw_images)
+                            accepted.append((
+                                None,                           # review_id: not in UCSD source
+                                reviewer_id,                    # from: reviewerID
+                                asin,                           # from: asin
+                                None,                           # product_title: not in UCSD source
+                                rating,                         # from: overall -> float
+                                clean_text(raw_title),          # from: summary
+                                review_text,                    # from: reviewText
+                                review_date,                    # from: unixReviewTime -> DATE
+                                review_length,
+                                parse_bool_truefalse(raw_verified),  # NULL for all UCSD rows
+                                helpful_votes,                  # from: helpful[0]
+                                total_votes,                    # from: helpful[1]
+                                None,                           # vine_reviewer: not in UCSD source
+                                SOURCE_UCSD,
+                                f"{reviewer_id}|{asin}|{raw_timestamp}",
+                            ))
 
-            if len(accepted) >= CHUNK_SIZE:
-                flush_accepted(conn, accepted)
-                total_accepted += len(accepted)
-                accepted = []
+                if len(accepted) >= CHUNK_SIZE:
+                    flush_accepted(write_conn, accepted)
+                    total_accepted += len(accepted)
+                    accepted = []
 
-            if len(rejected) >= CHUNK_SIZE:
-                flush_rejected(conn, rejected)
-                total_rejected += len(rejected)
-                rejected = []
+                if len(rejected) >= CHUNK_SIZE:
+                    flush_rejected(write_conn, rejected)
+                    total_rejected += len(rejected)
+                    rejected = []
 
-            if rows_read % 500_000 == 0:
-                logger.info(
-                    f"  UCSD: {rows_read:,} read | "
-                    f"{total_accepted + len(accepted):,} accepted | "
-                    f"{total_rejected + len(rejected):,} rejected"
-                )
+                if rows_read % UCSD_PROGRESS_INTERVAL == 0:
+                    logger.info(
+                        f"  UCSD: {rows_read:,} read | "
+                        f"{total_accepted + len(accepted):,} accepted | "
+                        f"{total_rejected + len(rejected):,} rejected"
+                    )
 
-    if accepted:
-        flush_accepted(conn, accepted)
-        total_accepted += len(accepted)
-    if rejected:
-        flush_rejected(conn, rejected)
-        total_rejected += len(rejected)
+        if accepted:
+            flush_accepted(write_conn, accepted)
+            total_accepted += len(accepted)
+        if rejected:
+            flush_rejected(write_conn, rejected)
+            total_rejected += len(rejected)
 
-    logger.info(f"  UCSD done: {rows_read:,} read | {total_accepted:,} accepted | {total_rejected:,} rejected")
-    logger.info(f"  Breakdown: {breakdown}")
-    log_silver_run(conn, run_id, "ucsd", rows_read, total_accepted,
-                   total_rejected, breakdown, "success", None, started_at)
-    return total_accepted, total_rejected
+        write_pipeline_log(
+            write_conn, run_id, SOURCE_UCSD, rows_read,
+            total_accepted, total_rejected, breakdown,
+            "success", None, started_at,
+        )
+        logger.info(f"  UCSD done: {rows_read:,} read | {total_accepted:,} accepted | {total_rejected:,} rejected")
+        logger.info(f"  Breakdown: {breakdown}")
 
-
-# ─────────────────────────────────────────────────────────────
-def process_aws(conn, run_id: str, dedup_cache: set):
-    """
-    Read bronze.aws_reviews, map real Kaggle field names to Silver schema.
-
-    Key Kaggle-specific handling based on inspect.py findings:
-    - star_rating is string "5" not float "5.0" -> parse_rating handles both
-    - review_date is already YYYY-MM-DD string -> just validate
-    - helpful_votes and total_votes are separate string fields -> parse_int
-    - verified_purchase is Y/N string -> parse_verified_kaggle -> boolean
-    - vine is Y/N string -> parse_vine -> boolean
-    - product_title exists here but not in UCSD -> store it
-    """
-    logger.info("=== Processing Kaggle/AWS Bronze -> Silver ===")
-    started_at     = datetime.now()
-    rows_read      = 0
-    accepted       = []
-    rejected       = []
-    total_accepted = 0
-    total_rejected = 0
-    breakdown      = {
-        NULL_RATING: 0, INVALID_RATING: 0,
-        NULL_REVIEWER: 0, NULL_ASIN: 0,
-        DUPLICATE: 0, TOO_SHORT: 0
-    }
-
-    with conn.cursor(name="aws_silver_cursor") as cur:
-        cur.itersize = CHUNK_SIZE
-        cur.execute("""
-            SELECT
-                customer_id,       -- reviewer identifier (Kaggle name)
-                product_id,        -- asin equivalent (Kaggle name)
-                product_title,     -- product name - only Kaggle has this
-                star_rating,       -- rating as string "1"-"5" (Kaggle name)
-                review_headline,   -- review title (Kaggle name)
-                review_body,       -- review text (Kaggle name)
-                review_date,       -- YYYY-MM-DD string (Kaggle name)
-                verified_purchase, -- Y/N string (Kaggle name)
-                helpful_votes,     -- integer string (Kaggle name)
-                total_votes,       -- integer string (Kaggle name)
-                vine,              -- Y/N string (Kaggle name)
-                review_id          -- unique review ID (Kaggle only)
-            FROM bronze.aws_reviews
-        """)
-
-        for row in cur:
-            rows_read += 1
-            (raw_customer_id, raw_product_id, raw_product_title,
-             raw_rating, raw_headline, raw_body,
-             raw_date, raw_verified, raw_helpful,
-             raw_total, raw_vine, raw_review_id) = row
-
-            reviewer_id = str(raw_customer_id).strip() if raw_customer_id else None
-            asin        = str(raw_product_id).strip()  if raw_product_id  else None
-
-            reason = None
-            rating = None
-
-            if not reviewer_id:
-                reason = NULL_REVIEWER
-            elif not asin:
-                reason = NULL_ASIN
-            elif not raw_rating or str(raw_rating).strip() == "":
-                reason = NULL_RATING
-            else:
-                rating = parse_rating(raw_rating)
-                if rating is None:
-                    reason = INVALID_RATING
-
-            if reason:
-                breakdown[reason] += 1
-                rejected.append((
-                    "aws", reviewer_id, asin,
-                    str(raw_rating) if raw_rating else None,
-                    str(raw_body)[:500] if raw_body else None,
-                    reason, run_id,
-                ))
-            else:
-                review_date = parse_date_string(raw_date)
-                dedup_key   = (reviewer_id, asin, review_date)
-
-                if dedup_key in dedup_cache:
-                    breakdown[DUPLICATE] += 1
-                    rejected.append((
-                        "aws", reviewer_id, asin,
-                        str(raw_rating), None,
-                        DUPLICATE, run_id,
-                    ))
-                else:
-                    review_text   = str(raw_body).strip() if raw_body else None
-                    review_length = len(review_text) if review_text else 0
-
-                    if review_text is not None and review_length < 3:
-                        breakdown[TOO_SHORT] += 1
-                        rejected.append((
-                            "aws", reviewer_id, asin,
-                            str(raw_rating), review_text,
-                            TOO_SHORT, run_id,
-                        ))
-                    else:
-                        dedup_cache.add(dedup_key)
-                        accepted.append((
-                            str(raw_review_id) if raw_review_id else None,
-                            reviewer_id,                        # from: customer_id
-                            asin,                               # from: product_id
-                            str(raw_product_title).strip() if raw_product_title else None,
-                            rating,                             # from: star_rating -> float
-                            str(raw_headline).strip() if raw_headline else None,
-                            review_text,                        # from: review_body
-                            review_date,                        # from: review_date -> DATE
-                            review_length,
-                            parse_verified_kaggle(raw_verified),
-                            parse_int(raw_helpful),             # from: helpful_votes
-                            parse_int(raw_total),               # from: total_votes
-                            parse_vine(raw_vine),               # from: vine -> boolean
-                            "aws",
-                            str(raw_review_id) if raw_review_id else None,
-                        ))
-
-            if len(accepted) >= CHUNK_SIZE:
-                flush_accepted(conn, accepted)
-                total_accepted += len(accepted)
-                accepted = []
-
-            if len(rejected) >= CHUNK_SIZE:
-                flush_rejected(conn, rejected)
-                total_rejected += len(rejected)
-                rejected = []
-
-            if rows_read % 100_000 == 0:
-                logger.info(
-                    f"  AWS: {rows_read:,} read | "
-                    f"{total_accepted + len(accepted):,} accepted | "
-                    f"{total_rejected + len(rejected):,} rejected"
-                )
-
-    if accepted:
-        flush_accepted(conn, accepted)
-        total_accepted += len(accepted)
-    if rejected:
-        flush_rejected(conn, rejected)
-        total_rejected += len(rejected)
-
-    logger.info(f"  AWS done: {rows_read:,} read | {total_accepted:,} accepted | {total_rejected:,} rejected")
-    logger.info(f"  Breakdown: {breakdown}")
-    log_silver_run(conn, run_id, "aws", rows_read, total_accepted,
-                   total_rejected, breakdown, "success", None, started_at)
-    return total_accepted, total_rejected
+    except Exception as e:
+        write_pipeline_log(
+            write_conn, run_id, SOURCE_UCSD, rows_read,
+            total_accepted, total_rejected, breakdown,
+            "failed", str(e), started_at,
+        )
+        raise
+    finally:
+        read_conn.close()
+        write_conn.close()
 
 
 # ── Post-load audit ───────────────────────────────────────────
-def audit_silver(conn):
+def audit_silver():
+    conn = make_connection()
     logger.info("\nSILVER LAYER AUDIT")
     queries = {
-        "Total rows": "SELECT COUNT(*) FROM silver.reviews",
-        "Rows by source": "SELECT source, COUNT(*) FROM silver.reviews GROUP BY source ORDER BY source",
-        "Rating distribution": "SELECT rating, COUNT(*) as cnt FROM silver.reviews GROUP BY rating ORDER BY rating",
-        "Verified purchase": "SELECT verified_purchase, COUNT(*) FROM silver.reviews GROUP BY verified_purchase",
-        "Total rejected": "SELECT COUNT(*) FROM silver.rejected_reviews",
-        "Rejection reasons": "SELECT rejection_reason, COUNT(*) as cnt FROM silver.rejected_reviews GROUP BY rejection_reason ORDER BY cnt DESC",
-        "Review date range": "SELECT MIN(review_date), MAX(review_date) FROM silver.reviews",
-        "Pipeline log": "SELECT source, rows_read, rows_accepted, rows_rejected, status FROM silver.pipeline_log ORDER BY finished_at DESC",
+        "Total rows in silver.reviews":
+            "SELECT COUNT(*) FROM silver.reviews",
+        "Rows by source":
+            "SELECT source, COUNT(*) FROM silver.reviews GROUP BY source ORDER BY source",
+        "Rating distribution":
+            "SELECT rating, COUNT(*) AS cnt FROM silver.reviews GROUP BY rating ORDER BY rating",
+        "Verified purchase split":
+            "SELECT verified_purchase, COUNT(*) FROM silver.reviews GROUP BY verified_purchase",
+        "Total rejected rows":
+            "SELECT COUNT(*) FROM silver.rejected_reviews",
+        "Rejection breakdown":
+            "SELECT rejection_reason, COUNT(*) AS cnt FROM silver.rejected_reviews GROUP BY rejection_reason ORDER BY cnt DESC",
+        "Review date range":
+            "SELECT MIN(review_date), MAX(review_date) FROM silver.reviews",
+        "Null rates":
+            """SELECT
+                ROUND(100.0 * SUM(CASE WHEN review_text IS NULL THEN 1 ELSE 0 END) / COUNT(*), 2) AS text_null_pct,
+                ROUND(100.0 * SUM(CASE WHEN review_date IS NULL THEN 1 ELSE 0 END) / COUNT(*), 2) AS date_null_pct
+               FROM silver.reviews""",
+        "Pipeline log":
+            "SELECT source, rows_read, rows_accepted, rows_rejected, status, finished_at FROM silver.pipeline_log ORDER BY finished_at DESC",
     }
     with conn.cursor() as cur:
         for label, sql in queries.items():
@@ -577,33 +603,33 @@ def audit_silver(conn):
             except Exception as e:
                 logger.error(f"  Query failed: {e}")
                 conn.rollback()
+    conn.close()
 
 
-# ─────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", choices=["ucsd", "aws", "all"], default="all")
+    parser = argparse.ArgumentParser(description="Silver layer pipeline")
+    parser.add_argument(
+        "--source",
+        choices=[SOURCE_AWS, SOURCE_UCSD, "all"],
+        default="all",
+        help="Which Bronze source to process"
+    )
     args = parser.parse_args()
 
     run_id = str(uuid.uuid4())
-    logger.info(f"Silver run ID: {run_id}")
+    logger.info(f"Silver pipeline run ID: {run_id}")
 
-    conn = get_connection()
-    try:
-        dedup_cache = build_dedup_cache(conn)
+    # Build dedup cache on its own connection — closed after use
+    cache_conn   = make_connection()
+    dedup_cache  = build_dedup_cache(cache_conn)
+    cache_conn.close()
 
-        if args.source in ("aws", "all"):
-            process_aws(conn, run_id, dedup_cache)
+    if args.source in (SOURCE_AWS, "all"):
+        process_aws(run_id, dedup_cache)
 
-        if args.source in ("ucsd", "all"):
-            process_ucsd(conn, run_id, dedup_cache)
+    if args.source in (SOURCE_UCSD, "all"):
+        process_ucsd(run_id, dedup_cache)
 
-        audit_silver(conn)
-
-    except Exception as e:
-        logger.error(f"Silver pipeline failed: {e}")
-        raise
-    finally:
-        conn.close()
-        logger.info("Connection closed.")
+    audit_silver()
+    logger.info("Silver pipeline complete.")
