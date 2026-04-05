@@ -301,7 +301,7 @@ sql/02_create_silver.sql    -- Silver tables and indexes
 ```bash
 # Always run this before touching the ingestion scripts
 # It reads the actual field names from both source files
-venv\Scripts\python.exe inspect.py
+venv\Scripts\python.exe preview_sources.py
 ```
 
 The rule: never write an ingestion script without inspecting the real file
