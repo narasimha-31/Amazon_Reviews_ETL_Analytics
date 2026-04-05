@@ -252,7 +252,7 @@ amazon-reviews-intelligence-platform/
 │       └── logger.py                 # Structured logger — console + rotating file
 ├── screenshots/                      # Evidence screenshots for README
 ├── logs/                             # Pipeline logs (gitignored)
-├── inspect.py                        # Inspect raw files before scripting — always run first
+├── preview_sources.py                        # Inspect raw files before scripting — always run first
 ├── requirements.txt
 ├── .env.example
 └── README.md
