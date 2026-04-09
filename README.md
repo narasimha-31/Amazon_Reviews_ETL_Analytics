@@ -252,7 +252,7 @@ amazon-reviews-intelligence-platform/
 │       └── logger.py                 # Structured logger — console + rotating file
 ├── screenshots/                      # Evidence screenshots for README
 ├── logs/                             # Pipeline logs (gitignored)
-├── inspect.py                        # Inspect raw files before scripting — always run first
+├── preview_sources.py                        # Inspect raw files before scripting — always run first
 ├── requirements.txt
 ├── .env.example
 └── README.md
@@ -301,7 +301,7 @@ sql/02_create_silver.sql    -- Silver tables and indexes
 ```bash
 # Always run this before touching the ingestion scripts
 # It reads the actual field names from both source files
-venv\Scripts\python.exe inspect.py
+venv\Scripts\python.exe preview_sources.py
 ```
 
 The rule: never write an ingestion script without inspecting the real file
