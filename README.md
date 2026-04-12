@@ -55,35 +55,35 @@ is the actual skill being demonstrated.
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  DATA SOURCES                                                    │
-│  UCSD Amazon Reviews 2023 (JSON.gz) + Kaggle Electronics TSV    │
+│  UCSD Amazon Reviews 2023 (JSON.gz) + Kaggle Electronics TSV     │
 └─────────────────────────┬────────────────────────────────────────┘
                           │  src/ingestion/load_bronze.py
                           ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  BRONZE LAYER  (bronze schema — PostgreSQL)                      │
-│  Raw data · Zero transformation · Full audit trail              │
-│  Tables: ucsd_reviews · aws_reviews · pipeline_log              │
+│  Raw data · Zero transformation · Full audit trail               │
+│  Tables: ucsd_reviews · aws_reviews · pipeline_log               │
 └─────────────────────────┬────────────────────────────────────────┘
                           │  src/silver/load_silver.py
                           ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  SILVER LAYER  (silver schema)                                   │
-│  Cleaned · Typed · Deduplicated · Dead-letter queue             │
-│  Tables: reviews · rejected_reviews · pipeline_log              │
+│  Cleaned · Typed · Deduplicated · Dead-letter queue              │
+│  Tables: reviews · rejected_reviews · pipeline_log               │ 
 └─────────────────────────┬────────────────────────────────────────┘
                           │  Phase 3 — dbt Gold models
                           ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  GOLD LAYER  (gold schema)                                       │
-│  Sentiment scores · Fake review flags · Business KPIs           │
+│  Sentiment scores · Fake review flags · Business KPIs            │
 │  Tables: product_metrics · category_benchmarks · sentiment_trends│
 └─────────────────────────┬────────────────────────────────────────┘
                           │  Power BI live connection
                           ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  DASHBOARDS                                                      │
-│  Sentiment Overview · Conversion Intel · Fake Review Radar      │
-│  Category Benchmarks · Pipeline Observability                   │
+│  Sentiment Overview · Conversion Intel · Fake Review Radar       │
+│  Category Benchmarks · Pipeline Observability                    │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
