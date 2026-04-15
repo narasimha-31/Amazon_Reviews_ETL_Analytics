@@ -1,17 +1,3 @@
-"""
-download_data.py — Phase 1, Step 1
-Downloads raw data files from UCSD and AWS sources.
-
-Usage:
-    python src/ingestion/download_data.py --source all
-    python src/ingestion/download_data.py --source ucsd
-    python src/ingestion/download_data.py --source aws
-    python src/ingestion/download_data.py --source ucsd --category Electronics
-
-Files land in: data/raw/ucsd/   and   data/raw/aws/
-Nothing is extracted or modified — files stay as .gz
-"""
-
 import argparse
 import hashlib
 import sys
@@ -20,7 +6,7 @@ from pathlib import Path
 import requests
 from tqdm import tqdm
 
-# ── Allow running from project root ──────────────────────────
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from src.config import UCSD_CATEGORIES, AWS_FILES, DATA_DIR, LOG_DIR, DOWNLOAD_TIMEOUT
@@ -29,7 +15,6 @@ from src.utils.logger import get_logger
 logger = get_logger("download_data", LOG_DIR)
 
 
-# ─────────────────────────────────────────────────────────────
 def download_file(url: str, dest_path: Path, label: str) -> bool:
     """
     Stream-download a file with a progress bar.
@@ -69,13 +54,12 @@ def download_file(url: str, dest_path: Path, label: str) -> bool:
 
     except requests.exceptions.RequestException as e:
         logger.error(f"FAILED {label}: {e}")
-        # Remove partial file to avoid confusing the loader later
+
         if dest_path.exists():
             dest_path.unlink()
         return False
 
 
-# ─────────────────────────────────────────────────────────────
 def download_ucsd(category_filter: str = None):
     """Download UCSD Amazon Reviews 2023 files."""
     ucsd_dir = DATA_DIR / "ucsd"
@@ -111,7 +95,7 @@ def download_aws(category_filter: str = None):
     results = {}
 
     for category, url in files.items():
-        filename  = Path(url).name         # keep original filename
+        filename  = Path(url).name         
         dest_path = aws_dir / filename
         success   = download_file(url, dest_path, f"AWS/{category}")
         results[category] = "OK" if success else "FAILED"
@@ -130,7 +114,6 @@ def _print_summary(source: str, results: dict):
     logger.info(f"{'─'*50}")
 
 
-# ─────────────────────────────────────────────────────────────
 def inspect_raw_files():
     """
     After download: print a quick inventory of what landed in data/raw/.
@@ -151,7 +134,7 @@ def inspect_raw_files():
     logger.info(f"\nTotal on disk: {total_gb:.2f} GB")
 
 
-# ─────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download Amazon review raw data files")
     parser.add_argument(
