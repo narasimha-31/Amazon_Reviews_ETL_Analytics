@@ -1,15 +1,4 @@
--- ============================================================
--- Amazon Reviews Intelligence Platform — Gold Layer Schema
--- Run this ONCE in pgAdmin before running score_sentiment.py
--- ============================================================
--- Gold tables are the ONLY layer Power BI connects to.
--- Every table here is the result of NLP, aggregation, or ML.
--- No raw text, no Bronze/Silver internals — business metrics only.
--- ============================================================
 
--- ── 1. gold.review_sentiment ─────────────────────────────────
--- One row per review that has been scored by VADER.
--- This is the central table — everything else aggregates from it.
 
 DROP TABLE IF EXISTS gold.review_sentiment;
 CREATE TABLE gold.review_sentiment (
