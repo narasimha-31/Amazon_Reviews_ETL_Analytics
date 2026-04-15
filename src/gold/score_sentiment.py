@@ -1,28 +1,3 @@
-"""
-score_sentiment.py - Phase 3, Step 1
-VADER sentiment scoring with keyset pagination checkpoint.
-
-Architecture:
-    read_conn  - named server-side cursor streams silver.reviews
-    write_conn - inserts scored rows into gold.review_sentiment
-
-Checkpoint system (keyset pagination):
-    On startup: reads the LAST scored row's (source, review_date, reviewer_id)
-    Uses WHERE (source, review_date, reviewer_id) > (last_src, last_date, last_rev)
-    → O(log N) index seek — instant resume at ANY offset
-    → No more OFFSET slowdown at 5M, 10M, 20M rows
-
-Requires index:
-    CREATE INDEX idx_silver_nlp_order
-    ON silver.reviews(source, review_date, reviewer_id)
-    WHERE review_text IS NOT NULL;
-
-Usage:
-    python src/gold/score_sentiment.py              -- scores all rows
-    python src/gold/score_sentiment.py --limit 100000  -- test run
-    python src/gold/score_sentiment.py --reset      -- clears gold and restarts
-"""
-
 import sys
 import uuid
 import argparse
@@ -40,7 +15,7 @@ from src.utils.logger import get_logger
 logger = get_logger("score_sentiment", LOG_DIR)
 
 
-# ── Constants ─────────────────────────────────────────────────
+# ── Constants ───────
 POSITIVE_THRESHOLD  =  0.05
 NEGATIVE_THRESHOLD  = -0.05
 PROGRESS_INTERVAL   = 500_000
@@ -104,7 +79,6 @@ def rating_agrees(rating, label: str):
     return False
 
 
-# ── Checkpoint via keyset pagination ──────────────────────────
 def get_checkpoint(conn):
     """
     Returns (count, last_source, last_review_date, last_reviewer_id).
@@ -119,7 +93,7 @@ def get_checkpoint(conn):
             conn.commit()
             return 0, None, None, None
 
-        # Get the MAX row in sort order — this is where we resume AFTER
+
         cur.execute("""
             SELECT source, review_date, reviewer_id
             FROM gold.review_sentiment
@@ -131,7 +105,7 @@ def get_checkpoint(conn):
     return count, row[0], row[1], row[2]
 
 
-# ── Main scoring function ─────────────────────────────────────
+# ── Main scoring function ─────────
 def score_sentiment(limit=None):
     run_id     = str(uuid.uuid4())
     started_at = datetime.now()
@@ -147,7 +121,7 @@ def score_sentiment(limit=None):
     write_conn = make_conn()
 
     try:
-        # ── Checkpoint ────────────────────────────────────────
+
         already_scored, last_src, last_date, last_rev = get_checkpoint(write_conn)
         logger.info(f"Checkpoint: {already_scored:,} rows already scored")
 
@@ -170,11 +144,10 @@ def score_sentiment(limit=None):
             ))
         write_conn.commit()
 
-        # ── Build query ───────────────────────────────────────
         lim_clause = f"LIMIT {limit}" if limit else ""
 
         if already_scored > 0:
-            # KEYSET PAGINATION — index seek, O(log N), instant at any offset
+
             query = f"""
                 SELECT reviewer_id, asin, review_date, source, rating,
                        review_text, review_length, verified_purchase, helpful_votes
@@ -186,7 +159,7 @@ def score_sentiment(limit=None):
             """
             query_params = (last_src, last_date, last_rev)
         else:
-            # Fresh start — no WHERE filter needed
+
             query = f"""
                 SELECT reviewer_id, asin, review_date, source, rating,
                        review_text, review_length, verified_purchase, helpful_votes
@@ -241,14 +214,13 @@ def score_sentiment(limit=None):
                     if rows_failed <= 5:
                         logger.warning(f"Row failed: {e}")
 
-                # ── Flush batch ───────────────────────────────
+
                 if len(batch) >= INSERT_BATCH_SIZE:
                     with write_conn.cursor() as wcur:
                         execute_values(wcur, INSERT_SENTIMENT, batch, page_size=1000)
                     write_conn.commit()
                     batch.clear()
 
-                # ── Progress log ──────────────────────────────
                 total_so_far = already_scored + rows_scored
                 if rows_scored > 0 and rows_scored % PROGRESS_INTERVAL == 0:
                     elapsed = (datetime.now() - t_start).total_seconds()
@@ -266,13 +238,12 @@ def score_sentiment(limit=None):
                         f"pos={pct_p}% neg={pct_n}%"
                     )
 
-            # ── Flush remaining ───────────────────────────────
             if batch:
                 with write_conn.cursor() as wcur:
                     execute_values(wcur, INSERT_SENTIMENT, batch, page_size=1000)
                 write_conn.commit()
 
-        # ── Final summary ─────────────────────────────────────
+
         total   = max(rows_scored, 1)
         avg_c   = round(sum_compound / total, 4)
         pct_pos = round(count_pos / total * 100, 2)
