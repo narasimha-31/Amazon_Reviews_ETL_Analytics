@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# ── Load .env file ────────────────────────────────────────────
+# ── Load .env file ───────
 load_dotenv()
 
 # ── Project root (works regardless of where script is called from) ──
@@ -15,7 +15,7 @@ SQL_DIR    = ROOT_DIR / "sql"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── PostgreSQL connection string ─────────────────────────────
+# ── PostgreSQL connection string ──────
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST",     "localhost"),
     "port":     os.getenv("DB_PORT",     "5432"),
@@ -46,7 +46,7 @@ UCSD_CATEGORIES = {
 
 KAGGLE_DATA_DIR = DATA_DIR / "kaggle"
 
-# ── Ingestion settings ────────────────────────────────────────
-CHUNK_SIZE         = 50_000    # rows per DB insert batch — tune down if memory is tight
-DOWNLOAD_TIMEOUT   = 60        # seconds before HTTP timeout
+# ── Ingestion settings ───────
+CHUNK_SIZE         = 50_000   
+DOWNLOAD_TIMEOUT   = 60        
 LOG_LEVEL          = os.getenv("LOG_LEVEL", "INFO")
