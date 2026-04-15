@@ -1,9 +1,3 @@
-"""
-logger.py — Structured logger for the Amazon pipeline.
-Every script imports get_logger() from here.
-Logs go to both console (coloured) and a rotating file.
-"""
-
 import logging
 import sys
 from datetime import datetime
@@ -12,11 +6,7 @@ from logging.handlers import RotatingFileHandler
 
 
 def get_logger(name: str, log_dir: Path = None) -> logging.Logger:
-    """
-    Returns a named logger that writes to:
-      - stdout  (INFO and above, coloured by level)
-      - logs/<name>_YYYYMMDD.log  (DEBUG and above, rotating 10MB)
-    """
+
     logger = logging.getLogger(name)
 
     # Avoid adding duplicate handlers on re-import
