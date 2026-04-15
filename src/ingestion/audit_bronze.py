@@ -1,16 +1,3 @@
-"""
-audit_bronze.py — Phase 1, Step 3
-Runs a comprehensive data quality audit on the Bronze layer
-and writes a markdown report to logs/bronze_audit_YYYYMMDD.md
-
-This is the "data quality issues" document that the LinkedIn post
-and the project PDF both say you MUST produce. Screenshot this.
-Put it in your README. Talk about it in interviews.
-
-Usage:
-    python src/ingestion/audit_bronze.py
-"""
-
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -24,9 +11,9 @@ import psycopg2
 logger = get_logger("audit_bronze", LOG_DIR)
 
 
-# ─────────────────────────────────────────────────────────────
+
 AUDIT_QUERIES = {
-    # ── UCSD dataset checks ───────────────────────────────────
+    # ── UCSD dataset checks ─────────
     "ucsd_total_rows": {
         "sql": "SELECT COUNT(*) AS total FROM bronze.ucsd_reviews",
         "label": "UCSD: Total rows loaded",
@@ -157,7 +144,7 @@ AUDIT_QUERIES = {
 }
 
 
-# ─────────────────────────────────────────────────────────────
+
 def run_audit():
     conn = psycopg2.connect(**{k: v for k, v in {
         "host": DB_CONFIG["host"], "port": DB_CONFIG["port"],
@@ -237,6 +224,5 @@ def _write_markdown_report(path: Path, findings: list):
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
-# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     run_audit()
