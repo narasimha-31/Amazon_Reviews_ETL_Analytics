@@ -24,14 +24,10 @@ CREATE TABLE gold.review_sentiment (
     --   between           → NEUTRAL
     sentiment_label     TEXT,           -- "POSITIVE", "NEGATIVE", "NEUTRAL"
 
-    -- Does VADER agree with the star rating?
-    -- Positive label + rating >= 4  → TRUE
-    -- Negative label + rating <= 2  → TRUE
-    -- Otherwise                     → FALSE  (disagreement = interesting case)
+
     rating_sentiment_agree  BOOLEAN,
 
-    -- review metadata kept here for easy dashboard queries
-    -- (avoids joining back to Silver for every dashboard view)
+
     review_length       INTEGER,
     verified_purchase   BOOLEAN,
     helpful_votes       INTEGER,
@@ -40,14 +36,11 @@ CREATE TABLE gold.review_sentiment (
     scored_at           TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ── 2. gold.product_metrics ──────────────────────────────────
--- One row per ASIN — the product-level intelligence table.
--- This is what the Sentiment Overview and Conversion dashboards read.
 
 DROP TABLE IF EXISTS gold.product_metrics;
 CREATE TABLE gold.product_metrics (
     asin                    TEXT        PRIMARY KEY,
-    product_title           TEXT,       -- from Kaggle rows; NULL for UCSD-only products
+    product_title           TEXT,      
 
     -- review volume
     total_reviews           INTEGER,
@@ -64,9 +57,6 @@ CREATE TABLE gold.product_metrics (
     pct_negative            NUMERIC(5,2),
     pct_neutral             NUMERIC(5,2),
 
-    -- the gap between what stars say and what text says
-    -- positive gap = text more positive than stars suggest
-    -- negative gap = text more negative than stars suggest
     sentiment_rating_gap    NUMERIC(5,4),
 
     -- review velocity
@@ -82,9 +72,7 @@ CREATE TABLE gold.product_metrics (
     computed_at             TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ── 3. gold.category_benchmarks ──────────────────────────────
--- Sentiment benchmarks per source/category.
--- Used in Category Benchmarks dashboard.
+
 
 DROP TABLE IF EXISTS gold.category_benchmarks;
 CREATE TABLE gold.category_benchmarks (
@@ -99,9 +87,7 @@ CREATE TABLE gold.category_benchmarks (
     computed_at             TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ── 4. gold.fake_review_signals ──────────────────────────────
--- Reviewer-level suspicion scoring.
--- High score = reviewer shows patterns associated with fake reviews.
+
 
 DROP TABLE IF EXISTS gold.fake_review_signals;
 CREATE TABLE gold.fake_review_signals (
@@ -109,30 +95,22 @@ CREATE TABLE gold.fake_review_signals (
     source                  TEXT,
     total_reviews           INTEGER,
 
-    -- Fake review signals (each contributes to suspicion_score):
-    -- 1. High volume of reviews in short time
-    -- 2. Overwhelmingly 5-star (never critical)
-    -- 3. Short reviews (under 20 chars)
-    -- 4. Unverified purchases only
-    -- 5. Extreme sentiment variance (all positive or all negative)
+
     pct_five_star           NUMERIC(5,2),
     pct_unverified          NUMERIC(5,2),
     avg_review_length       NUMERIC(8,1),
-    pct_short_reviews       NUMERIC(5,2),   -- reviews under 20 chars
+    pct_short_reviews       NUMERIC(5,2),   
     avg_compound_score      NUMERIC(5,4),
     sentiment_variance      NUMERIC(7,4),
 
-    -- composite score 0-100, higher = more suspicious
-    -- computed as weighted sum of above signals
+
     suspicion_score         NUMERIC(5,2),
     suspicion_label         TEXT,           -- "LOW", "MEDIUM", "HIGH"
 
     computed_at             TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ── 5. gold.sentiment_run_log ────────────────────────────────
--- Tracks every VADER scoring run — how many rows, how long, etc.
--- This feeds the Pipeline Observability dashboard.
+
 
 DROP TABLE IF EXISTS gold.sentiment_run_log;
 CREATE TABLE gold.sentiment_run_log (
@@ -140,13 +118,13 @@ CREATE TABLE gold.sentiment_run_log (
     started_at      TIMESTAMPTZ,
     finished_at     TIMESTAMPTZ,
     rows_scored     INTEGER,
-    rows_skipped    INTEGER,    -- already scored in previous run (checkpoint)
+    rows_skipped    INTEGER,    
     rows_failed     INTEGER,
     avg_score       NUMERIC(5,4),
     pct_positive    NUMERIC(5,2),
     pct_negative    NUMERIC(5,2),
     pct_neutral     NUMERIC(5,2),
-    status          TEXT        -- "running", "complete", "failed"
+    status          TEXT        
 );
 
 -- ── Indexes for dashboard query patterns ─────────────────────
@@ -172,7 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_sentiment_dedup
 CREATE INDEX IF NOT EXISTS idx_fake_score
     ON gold.fake_review_signals(suspicion_score DESC);
 
--- ── Verify ───────────────────────────────────────────────────
+-- ── Verify ──
 SELECT table_name
 FROM information_schema.tables
 WHERE table_schema = 'gold'
