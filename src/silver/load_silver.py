@@ -1,38 +1,3 @@
-"""
-load_silver.py - Phase 2: Bronze -> Silver transformation pipeline.
-
-Architecture decision: two database connections per source.
-  read_conn  - streams rows from Bronze using a named server-side cursor
-  write_conn - inserts into silver.reviews and silver.rejected_reviews
-
-Why two connections?
-Named cursors require their transaction to stay open for the entire read.
-conn.commit() inside flush_accepted would close that transaction and
-invalidate the cursor mid-stream. Separating read and write avoids this
-entirely - write_conn can commit freely without touching read_conn.
-
-Field mapping confirmed by running inspect.py on real source files:
-
-  UCSD field        Kaggle field          Silver column
-  ----------        ------------          -------------
-  reviewerID        customer_id      -->  reviewer_id
-  asin              product_id       -->  asin
-  overall (float)   star_rating(str) -->  rating NUMERIC(2,1)
-  reviewText        review_body      -->  review_text
-  summary           review_headline  -->  review_title
-  unixReviewTime    review_date      -->  review_date DATE
-  helpful[0]        helpful_votes    -->  helpful_votes INTEGER
-  helpful[1]        total_votes      -->  total_votes INTEGER
-  (not present)     verified_purchase -> verified_purchase BOOLEAN
-  (not present)     vine             -->  vine_reviewer BOOLEAN
-  (not present)     product_title    -->  product_title TEXT
-
-Usage:
-    python src/silver/load_silver.py --source all
-    python src/silver/load_silver.py --source aws
-    python src/silver/load_silver.py --source ucsd
-"""
-
 import sys
 import uuid
 import json
@@ -62,15 +27,15 @@ NULL_ASIN      = "NULL_ASIN"
 DUPLICATE      = "DUPLICATE"
 TOO_SHORT      = "REVIEW_TOO_SHORT"
 
-# ── Tuning constants ─────────────────────────────────────────
-PAGE_SIZE              = 1000     # rows per psycopg2 execute_values page
-MIN_REVIEW_LENGTH      = 3        # reviews shorter than this go to dead-letter queue
-MAX_REJECTION_TEXT     = 500      # max chars of review text stored in rejection record
+# ── Tuning constants ────────
+PAGE_SIZE              = 1000     
+MIN_REVIEW_LENGTH      = 3        
+MAX_REJECTION_TEXT     = 500      
 DATE_FORMAT            = "%Y-%m-%d"
-UCSD_PROGRESS_INTERVAL = 500_000  # log progress every N rows for UCSD (41M rows)
-AWS_PROGRESS_INTERVAL  = 100_000  # log progress every N rows for AWS (3M rows)
+UCSD_PROGRESS_INTERVAL = 500_000  
+AWS_PROGRESS_INTERVAL  = 100_000  
 
-# ── SQL statements ────────────────────────────────────────────
+# ── SQL statements ───────────
 INSERT_REVIEWS = """
     INSERT INTO silver.reviews (
         review_id, reviewer_id, asin, product_title,
@@ -98,7 +63,7 @@ INSERT_LOG = """
 """
 
 
-# ── Connection factory ────────────────────────────────────────
+# ── Connection factory ──────────────
 def make_connection():
     return psycopg2.connect(
         host=DB_CONFIG["host"],
@@ -109,7 +74,7 @@ def make_connection():
     )
 
 
-# ── Type parsers ──────────────────────────────────────────────
+# ── Type parsers ─────────────────
 def parse_rating(raw):
     """
     UCSD overall = 4.0 stored as TEXT "4.0" in Bronze.
@@ -423,7 +388,7 @@ def process_aws(run_id, dedup_cache):
         write_conn.close()
 
 
-# ── Process UCSD ──────────────────────────────────────────────
+# ── Process UCSD ──────────────────
 def process_ucsd(run_id, dedup_cache):
     """
     Same two-connection pattern as process_aws.
@@ -499,23 +464,22 @@ def process_ucsd(run_id, dedup_cache):
                             ))
                         else:
                             dedup_cache.add(dedup_key)
-                            # UCSD helpful field stored as JSON list "[2,3]" in images column
-                            # helpful_votes = index 0, total_votes = index 1
+
                             helpful_votes, total_votes = parse_helpful_list(raw_images)
                             accepted.append((
-                                None,                           # review_id: not in UCSD source
-                                reviewer_id,                    # from: reviewerID
-                                asin,                           # from: asin
-                                None,                           # product_title: not in UCSD source
-                                rating,                         # from: overall -> float
-                                clean_text(raw_title),          # from: summary
-                                review_text,                    # from: reviewText
-                                review_date,                    # from: unixReviewTime -> DATE
+                                None,                           
+                                reviewer_id,                   
+                                asin,                          
+                                None,                          
+                                rating,                        
+                                clean_text(raw_title),         
+                                review_text,                    
+                                review_date,                    
                                 review_length,
-                                parse_bool_truefalse(raw_verified),  # NULL for all UCSD rows
-                                helpful_votes,                  # from: helpful[0]
-                                total_votes,                    # from: helpful[1]
-                                None,                           # vine_reviewer: not in UCSD source
+                                parse_bool_truefalse(raw_verified),  
+                                helpful_votes,                  
+                                total_votes,                    
+                                None,                           
                                 SOURCE_UCSD,
                                 f"{reviewer_id}|{asin}|{raw_timestamp}",
                             ))
@@ -564,7 +528,7 @@ def process_ucsd(run_id, dedup_cache):
         write_conn.close()
 
 
-# ── Post-load audit ───────────────────────────────────────────
+# ── Post-load audit ──────────────
 def audit_silver():
     conn = make_connection()
     logger.info("\nSILVER LAYER AUDIT")
@@ -606,7 +570,7 @@ def audit_silver():
     conn.close()
 
 
-# ── Entry point ───────────────────────────────────────────────
+# ── Entry point ───────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Silver layer pipeline")
     parser.add_argument(
@@ -620,7 +584,7 @@ if __name__ == "__main__":
     run_id = str(uuid.uuid4())
     logger.info(f"Silver pipeline run ID: {run_id}")
 
-    # Build dedup cache on its own connection — closed after use
+
     cache_conn   = make_connection()
     dedup_cache  = build_dedup_cache(cache_conn)
     cache_conn.close()

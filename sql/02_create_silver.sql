@@ -1,43 +1,32 @@
--- ============================================================
--- Amazon Review Intelligence - Silver Layer Schema
--- Run this ONCE in pgAdmin before running load_silver.py
--- ============================================================
-
--- silver.reviews: unified, cleaned, type-enforced table
--- One row = one valid review from either UCSD or Kaggle source
--- All column names, types, and formats are normalised here
-
 DROP TABLE IF EXISTS silver.reviews;
 CREATE TABLE silver.reviews (
 
     -- identifiers
     review_id           TEXT,
-    reviewer_id         TEXT        NOT NULL,   -- UCSD: reviewerID | Kaggle: customer_id
-    asin                TEXT        NOT NULL,   -- UCSD: asin | Kaggle: product_id
-    product_title       TEXT,                   -- Kaggle only, NULL for UCSD rows
+    reviewer_id         TEXT        NOT NULL,   
+    asin                TEXT        NOT NULL,   
+    product_title       TEXT,                   
 
     -- review content
-    rating              NUMERIC(2,1) NOT NULL,  -- UCSD: overall(float) | Kaggle: star_rating(str)
-    review_title        TEXT,                   -- UCSD: summary | Kaggle: review_headline
-    review_text         TEXT,                   -- UCSD: reviewText | Kaggle: review_body
-    review_date         DATE,                   -- UCSD: unixReviewTime->DATE | Kaggle: review_date
-    review_length       INTEGER,                -- computed: char count of review_text
+    rating              NUMERIC(2,1) NOT NULL,  
+    review_title        TEXT,                   
+    review_text         TEXT,                   
+    review_date         DATE,                   
+    review_length       INTEGER,                
 
     -- trust signals
-    verified_purchase   BOOLEAN,                -- UCSD: NULL (not in source) | Kaggle: Y/N->bool
-    helpful_votes       INTEGER,                -- UCSD: NULL (not in source) | Kaggle: helpful_votes
-    total_votes         INTEGER,                -- UCSD: NULL (not in source) | Kaggle: total_votes
-    vine_reviewer       BOOLEAN,                -- UCSD: NULL (not in source) | Kaggle: vine Y/N->bool
+    verified_purchase   BOOLEAN,                
+    helpful_votes       INTEGER,                
+    total_votes         INTEGER,                
+    vine_reviewer       BOOLEAN,                
 
     -- pipeline tracking
-    source              TEXT        NOT NULL,   -- "ucsd" or "aws"
+    source              TEXT        NOT NULL,   
     raw_source_id       TEXT,
     loaded_at           TIMESTAMPTZ DEFAULT NOW()
 );
 
--- silver.rejected_reviews: dead-letter queue
--- Every row that FAILED validation lands here with a reason tag
--- Never drop bad data silently - always explain why it was rejected
+
 
 DROP TABLE IF EXISTS silver.rejected_reviews;
 CREATE TABLE silver.rejected_reviews (
@@ -48,13 +37,7 @@ CREATE TABLE silver.rejected_reviews (
     raw_rating          TEXT,
     raw_review_text     TEXT,
     rejection_reason    TEXT NOT NULL,
-    -- Reason codes:
-    -- NULL_RATING       rating field is NULL or empty
-    -- INVALID_RATING    rating not castable or outside 1.0-5.0
-    -- NULL_REVIEWER_ID  reviewer_id is NULL
-    -- NULL_ASIN         asin is NULL
-    -- DUPLICATE         same reviewer_id + asin + review_date already exists
-    -- REVIEW_TOO_SHORT  review_text under 3 characters
+
     run_id              TEXT,
     rejected_at         TIMESTAMPTZ DEFAULT NOW()
 );

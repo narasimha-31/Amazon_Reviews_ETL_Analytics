@@ -1,19 +1,3 @@
-"""
-load_bronze.py — Phase 1, Step 2
-Reads raw .gz files from data/raw/ and loads them into the
-PostgreSQL bronze schema, chunk by chunk, with full audit logging.
-
-This script deliberately does ZERO cleaning.
-Every bad value, null, weird string — it all goes in as-is.
-The Bronze layer is your immutable audit trail.
-
-Usage:
-    python src/ingestion/load_bronze.py --source all
-    python src/ingestion/load_bronze.py --source ucsd
-    python src/ingestion/load_bronze.py --source aws
-    python src/ingestion/load_bronze.py --source ucsd --category Electronics
-"""
-
 import argparse
 import gzip
 import json
@@ -35,7 +19,7 @@ from src.utils.logger import get_logger
 
 logger = get_logger("load_bronze", LOG_DIR)
 
-# ── Columns we pull from each source (in order) ──────────────
+
 UCSD_COLUMNS = [
     "rating", "title", "text", "images",
     "asin", "parent_asin", "user_id",
@@ -50,7 +34,7 @@ AWS_COLUMNS = [
 ]
 
 
-# ─────────────────────────────────────────────────────────────
+
 def get_connection():
     """Open a raw psycopg2 connection (faster than SQLAlchemy for bulk loads)."""
     return psycopg2.connect(
@@ -80,7 +64,6 @@ def log_pipeline_run(conn, run_id, table, source_file, rows_attempted,
     conn.commit()
 
 
-# ─────────────────────────────────────────────────────────────
 def load_ucsd_file(conn, gz_path: Path, category: str, run_id: str):
     """
     Parse a UCSD .jsonl.gz file line by line and bulk-insert into
@@ -133,16 +116,7 @@ def load_ucsd_file(conn, gz_path: Path, category: str, run_id: str):
                 try:
                     obj = json.loads(line.strip())
 
-                    # UCSD 5-core field name mapping:
-                    # "overall"         → rating
-                    # "reviewText"      → text
-                    # "summary"         → title
-                    # "reviewerID"      → user_id
-                    # "unixReviewTime"  → timestamp
-                    # "verified"        → verified_purchase
-                    # "image"           → images
-                    # "asin"            → asin  (same in both sources)
-                    # "style"           → ignored (variant metadata)
+
                     rating_val = obj.get("overall") or obj.get("rating")
                     row = (
                         str(rating_val)                        if rating_val is not None else None,
@@ -168,10 +142,9 @@ def load_ucsd_file(conn, gz_path: Path, category: str, run_id: str):
 
                 except (json.JSONDecodeError, KeyError) as e:
                     bad_rows += 1
-                    if bad_rows <= 5:   # log first 5 bad lines, not thousands
+                    if bad_rows <= 5:  
                         logger.warning(f"  Bad JSON line #{total_rows}: {e}")
 
-        # flush remaining rows
         if chunk:
             flush_chunk(chunk)
 
@@ -198,7 +171,6 @@ def load_ucsd_file(conn, gz_path: Path, category: str, run_id: str):
     return loaded_rows, bad_rows
 
 
-# ─────────────────────────────────────────────────────────────
 def load_aws_file(conn, gz_path: Path, run_id: str):
     """
     Parse an AWS TSV .gz file using pandas read_csv in chunks.
@@ -225,8 +197,7 @@ def load_aws_file(conn, gz_path: Path, run_id: str):
         ext = gz_path.suffix.lower()
 
         if ext == ".zip":
-            # Kaggle ships .tsv.zip — open with zipfile, hand inner TSV to pandas
-            # Do NOT use compression="zip" in pandas — it routes through gzip and fails
+
             import zipfile, io
             zf       = zipfile.ZipFile(gz_path, "r")
             tsv_name = next(n for n in zf.namelist() if n.endswith(".tsv"))
@@ -241,7 +212,7 @@ def load_aws_file(conn, gz_path: Path, run_id: str):
                 low_memory=False,
             )
         else:
-            # Standard .tsv.gz
+        
             reader = pd.read_csv(
                 gz_path,
                 sep="\t",
@@ -258,10 +229,10 @@ def load_aws_file(conn, gz_path: Path, run_id: str):
         for chunk_df in reader:
             total_rows += len(chunk_df)
 
-            # Normalise column names to lowercase
+
             chunk_df.columns = [c.lower().strip() for c in chunk_df.columns]
 
-            # Only keep the columns we care about; fill any missing cols with None
+
             rows = []
             for _, row in chunk_df.iterrows():
                 rows.append(tuple(
@@ -299,7 +270,6 @@ def load_aws_file(conn, gz_path: Path, run_id: str):
     return loaded_rows, bad_rows
 
 
-# ─────────────────────────────────────────────────────────────
 def audit_bronze(conn):
     """
     After loading: print a full audit of what's in the Bronze layer.
@@ -358,8 +328,6 @@ def audit_bronze(conn):
 
     logger.info("\n" + "═"*55)
 
-
-# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Load raw files into Bronze layer")
     parser.add_argument("--source",   choices=["ucsd", "aws", "all"], default="all")
@@ -375,7 +343,7 @@ if __name__ == "__main__":
     try:
         if args.source in ("ucsd", "all"):
             ucsd_dir = DATA_DIR / "ucsd"
-            # Match both .jsonl.gz (category files) and .json.gz (5-core file)
+           
             all_gz = sorted(list(ucsd_dir.glob("*.jsonl.gz")) + list(ucsd_dir.glob("*.json.gz")))
             files = (
                 [f for f in all_gz if args.category.lower() in f.name.lower()]
@@ -385,16 +353,15 @@ if __name__ == "__main__":
             if not files:
                 logger.warning(f"No .json.gz or .jsonl.gz files found in {ucsd_dir}")
             for gz_path in files:
-                # For 5-core file (kcore_5.json.gz) use "5core" as category label
-                # For category files (Electronics.jsonl.gz) use the filename as label
+
                 stem = gz_path.name.replace(".jsonl.gz", "").replace(".json.gz", "")
                 category = stem if stem else "5core"
                 load_ucsd_file(conn, gz_path, category, run_id)
 
         if args.source in ("aws", "all"):
-            # Kaggle TSV files live in data/raw/kaggle/
+
             kaggle_dir = DATA_DIR / "kaggle"
-            # Match both .tsv.gz and .tsv.zip (Kaggle sometimes ships as .zip)
+
             tsv_files = sorted(
                 list(kaggle_dir.glob("*.tsv.gz")) +
                 list(kaggle_dir.glob("*.tsv.zip")) +
