@@ -183,49 +183,6 @@ exist in the UCSD source data. Documented, not a data quality bug.
 
 Null rates in Silver: review_text 0.02%, review_date 0.00%.
 
-> _[Screenshot: Silver audit output showing row counts and rejection breakdown]_
-
----
-
-## Phase 3 — Gold Layer & NLP _(in progress)_
-
-- [ ] VADER sentiment scoring on all review texts
-- [ ] Aspect-based sentiment with spaCy (battery, shipping, quality, price)
-- [ ] Fake review risk score per reviewer
-- [ ] TF-IDF keyword extraction — what actually drives 1-star vs 5-star reviews
-- [ ] Gold aggregation tables: product_metrics, category_benchmarks, sentiment_trends
-
----
-
-## Phase 4 — Business Analysis _(planned)_
-
-- [ ] Sentiment-to-sales-rank correlation model
-- [ ] Pricing sweet spot analysis by rating band
-- [ ] Review velocity as a leading indicator of rank change
-- [ ] Category health scorecard with $ impact estimates
-
-**Key findings will be documented here as Phase 4 completes.**
-
----
-
-## Phase 5 — Orchestration & Monitoring _(planned)_
-
-- [ ] Apache Airflow DAG — scheduled Bronze to Silver to Gold pipeline
-- [ ] Monitoring checks — null rate alerts, row count anomaly detection
-- [ ] Great Expectations test suite running at Silver ingestion
-- [ ] Pipeline alerts table with failure logging
-
----
-
-## Phase 6 — Dashboards & Delivery _(planned)_
-
-- [ ] Power BI live connection to PostgreSQL Gold layer (no CSV exports)
-- [ ] Sentiment Overview dashboard
-- [ ] Conversion Intelligence dashboard
-- [ ] Fake Review Radar dashboard
-- [ ] Category Benchmarks dashboard
-- [ ] Pipeline Observability dashboard
-- [ ] Executive summary framed for a category management team
 
 ---
 
